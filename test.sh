@@ -1,304 +1,571 @@
 #!/bin/bash
 # =============================================================================
-# Скрипт настройки Альт Сервера (Модуль 1: Сетевая инфраструктура)
+# Скрипт проверки Модуля 1: Настройка сетевой инфраструктуры
 # КОД 09.02.06-1-2026
 # =============================================================================
-
-set -e
 
 # Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Функции для вывода
-print_info()    { echo -e "${GREEN}[INFO]${NC} $1"; }
-print_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
-print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
-print_header()  { echo -e "\n${BLUE}========================================${NC}"; }
+NC='\033[0m' # No Color
 
 # =============================================================================
-# КОНФИГУРАЦИЯ
+# ⚙️ КОНФИГУРАЦИЯ
 # =============================================================================
 
-MODE="BR"
+# Домен (оставлен для проверок конфигурации внутри ВМ)
 DOMAIN="au-team.irpo"
-HOSTNAME_BASE="srv"
 
-if [[ "$MODE" == "BR" ]]; then
-    HOSTNAME="br-${HOSTNAME_BASE}"
-    EXTERNAL_IF="enp7s1"
-    EXTERNAL_IP="172.16.2.2/28"
-    INTERNAL_IF="enp7s2"
-    INTERNAL_IP="192.168.0.2/24"
-    INTERNAL_NET="192.168.0.0/24"
-    DEFAULT_GW="172.16.2.1"
-else
-    HOSTNAME="hq-${HOSTNAME_BASE}"
-    EXTERNAL_IF="enp7s1"
-    EXTERNAL_IP="192.168.100.2/27"
-    INTERNAL_IF="enp7s2"
-    INTERNAL_IP=""
-    INTERNAL_NET="192.168.100.0/27"
-    DEFAULT_GW="192.168.100.1"
-fi
-
-SSH_PORT="22"
-SSH_SECURE_PORT="2026"
+# Учетные данные
 ROOT_PASS='P@$$w0rd'
+SSHUSER_PASS='P@ssw0rd'
+NETADMIN_PASS='P@ssw0rd'
+
+# Порты
+PORT_ROOT=22
+PORT_SECURE=2026
+
+# 🔥 Хосты с реальными IP-адресами (вместо DNS-имён)
+declare -A HOSTS=(
+    ["ISP"]="172.16.1.1"           # Шлюз для офисов
+    ["HQ-RTR"]="172.16.1.2"        # Основной интерфейс HQ-RTR
+    ["BR-RTR"]="172.16.2.2"        # Основной интерфейс BR-RTR
+    ["HQ-SRV"]="192.168.100.2"     # Сервер HQ (VLAN 100)
+    ["BR-SRV"]="192.168.0.2"       # Сервер BR
+    ["HQ-CLI"]="192.168.200.2"     # Клиент HQ (VLAN 200)
+)
+
+# Типы устройств (linux/ecorouter)
+declare -A DEV_TYPE=(
+    ["ISP"]="linux"
+    ["HQ-RTR"]="ecorouter"
+    ["BR-RTR"]="ecorouter"
+    ["HQ-SRV"]="linux"
+    ["BR-SRV"]="linux"
+    ["HQ-CLI"]="linux"
+)
+
+# Счетчики
+TOTAL=0
+PASSED=0
+FAILED=0
+
+# Лог файл
+LOG_FILE="check_module1_$(date +%Y%m%d_%H%M%S).log"
+JSON_FILE="results_module1_$(date +%Y%m%d_%H%M%S).json"
 
 # =============================================================================
-# ПРОВЕРКИ
+# 📦 ФУНКЦИИ
 # =============================================================================
 
-if [[ $EUID -ne 0 ]]; then
-   print_error "Этот скрипт должен запускаться от root (sudo)"
-   exit 1
-fi
-
-print_header
-print_info "НАСТРОЙКА АЛЬТ СЕРВЕРА - Модуль 1"
-print_info "Код: 09.02.06-1-2026"
-print_header
-
-print_info "Режим: ${MODE} (${HOSTNAME})"
-print_info "Домен: ${DOMAIN}"
-print_info ""
-print_info "Сетевая конфигурация:"
-print_info "  - Внешний интерфейс: ${EXTERNAL_IF} -> ${EXTERNAL_IP}"
-if [[ -n "$INTERNAL_IP" ]]; then
-    print_info "  - Внутренний интерфейс: ${INTERNAL_IF} -> ${INTERNAL_IP}"
-fi
-print_info "  - Локальная сеть: ${INTERNAL_NET}"
-print_info "  - Шлюз по умолчанию: ${DEFAULT_GW}"
-print_info ""
-print_info "Учетные данные:"
-print_info "  - root пароль: ${ROOT_PASS}"
-print_info "  - SSH порты: ${SSH_PORT}, ${SSH_SECURE_PORT}"
-print_header
-
-# =============================================================================
-# ОСНОВНАЯ НАСТРОЙКА
-# =============================================================================
-
-# 1. Установка имени сервера
-print_info "Установка имени сервера: ${HOSTNAME}.${DOMAIN}..."
-hostnamectl set-hostname "${HOSTNAME}.${DOMAIN}" 2>/dev/null || hostnamectl set-hostname "$HOSTNAME"
-
-print_info "Обновление /etc/hosts..."
-cat > /etc/hosts << EOF
-127.0.0.1   localhost localhost.localdomain
-127.0.1.1   ${HOSTNAME}.${DOMAIN} ${HOSTNAME}
-::1         localhost localhost.localdomain ip6-localhost ip6-loopback
-ff02::1     ip6-allnodes
-ff02::2     ip6-allrouters
-
-# Сеть офиса
-${INTERNAL_NET%.*}.1    gateway.${DOMAIN} gateway
-${INTERNAL_NET%.*}.255  broadcast.${DOMAIN} broadcast
-EOF
-
-sleep 1
-CURRENT_HOST=$(hostname)
-if [[ "$CURRENT_HOST" == "$HOSTNAME"* ]]; then
-    print_info "Имя сервера установлено: $(hostname -f 2>/dev/null || hostname)"
-else
-    print_warn "Имя сервера применится после перезагрузки"
-fi
-
-# 2. Настройка интерфейсов
-configure_interface() {
-    local iface="$1"
-    local ip_addr="$2"
-    local is_default_gw="${3:-no}"
-    
-    if [[ -z "$ip_addr" ]]; then
-        return 0
-    fi
-    
-    print_info "Настройка интерфейса ${iface} -> ${ip_addr}..."
-    
-    mkdir -p /etc/net/ifaces/"${iface}"
-    
-    cat > /etc/net/ifaces/"${iface}"/options << EOF
-BOOTPROTO=static
-TYPE=eth
-DISABLED=no
-NM_CONTROLLED=no
-CONFIG_IPV4=YES
-CONFIG_IPV6=NO
-EOF
-    
-    echo "$ip_addr" > /etc/net/ifaces/"${iface}"/ipv4address
-    
-    if [[ "$is_default_gw" == "yes" && -n "$DEFAULT_GW" ]]; then
-        echo "default via ${DEFAULT_GW}" > /etc/net/ifaces/"${iface}"/route
-    fi
-    
-    print_info "Конфигурация ${iface} сохранена"
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
-configure_interface "$EXTERNAL_IF" "$EXTERNAL_IP" "yes"
+print_result() {
+    local task="$1"
+    local check="$2"
+    local status="$3"
+    local details="$4"
+    
+    ((TOTAL++))
+    log "TASK:$task CHECK:$check STATUS:$status DETAILS:$details"
+    
+    if [[ "$status" == "PASS" ]]; then
+        ((PASSED++))
+        echo -e "${GREEN}[✓]${NC} Задание $task: $check"
+    else
+        ((FAILED++))
+        echo -e "${RED}[✗]${NC} Задание $task: $check"
+    fi
+    [[ -n "$details" ]] && echo -e "    ${BLUE}ℹ️${NC} $details"
+}
 
-if [[ -n "$INTERNAL_IP" ]]; then
-    configure_interface "$INTERNAL_IF" "$INTERNAL_IP" "no"
-fi
+# SSH подключение к Linux-устройству
+ssh_linux() {
+    local host="$1"
+    local user="${2:-root}"
+    local pass="${3:-$ROOT_PASS}"
+    local port="${4:-$PORT_ROOT}"
+    local cmd="$5"
+    
+    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -p "$port" "${user}@${host}" "$cmd" 2>/dev/null
+}
 
-print_info "Перезапуск сетевой службы..."
-systemctl restart network 2>/dev/null || net restart 2>/dev/null || true
+# SSH подключение к EcoRouter
+ssh_eco() {
+    local host="$1"
+    local cmd="$2"
+    # EcoRouter использует стандартный SSH с паролем root
+    sshpass -p "$ROOT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -p 22 "root@${host}" "$cmd" 2>/dev/null
+}
 
-sleep 2
-print_info "Проверка IP-адресов..."
-ip -4 addr show | grep -E "inet .*(${EXTERNAL_IF}|${INTERNAL_IF})" || print_warn "Интерфейсы могут требовать перезагрузки"
+# Выполнение команды с учётом типа устройства
+exec_cmd() {
+    local vm="$1"
+    local cmd="$2"
+    local dtype="${DEV_TYPE[$vm]}"
+    local host="${HOSTS[$vm]}"
+    
+    if [[ "$dtype" == "ecorouter" ]]; then
+        ssh_eco "$host" "$cmd"
+    else
+        ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "$cmd"
+    fi
+}
 
-# 3. Включение IP-форвардинга
-print_info "Включение IP-форвардинга..."
+# =============================================================================
+# ✅ ПРОВЕРКИ
+# =============================================================================
 
-for conf_file in /etc/sysctl.conf /etc/net/sysctl.conf; do
-    if [[ -f "$conf_file" ]]; then
-        if grep -q "^net.ipv4.ip_forward" "$conf_file" 2>/dev/null; then
-            sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' "$conf_file"
+# Задание 1.1: Hostname (FQDN)
+check_hostname() {
+    local vm="$1"
+    local host="${HOSTS[$vm]}"
+    local dtype="${DEV_TYPE[$vm]}"
+    local expected="${vm,,}.$DOMAIN"
+    
+    echo -e "\n${YELLOW}>>> Проверка hostname: $vm${NC}"
+    
+    if [[ "$dtype" == "ecorouter" ]]; then
+        # ISP не требует FQDN
+        [[ "$vm" == "ISP" ]] && { print_result "1.1" "Hostname $vm" "PASS" "ISP - имя без домена"; return; }
+        
+        local out=$(ssh_eco "$host" "show hostname 2>/dev/null")
+        if [[ "$out" == *"$expected"* ]]; then
+            print_result "1.1" "Hostname $vm" "PASS" "$out"
         else
-            echo "net.ipv4.ip_forward = 1" >> "$conf_file"
+            print_result "1.1" "Hostname $vm" "FAIL" "Ожидается: $expected"
+        fi
+    else
+        local out=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "hostname -f 2>/dev/null")
+        if [[ "$out" == *"$expected"* ]]; then
+            print_result "1.1" "Hostname $vm" "PASS" "$out"
+        else
+            print_result "1.1" "Hostname $vm" "FAIL" "Ожидается: $expected, получено: $out"
         fi
     fi
-done
-
-sysctl -p /etc/sysctl.conf 2>/dev/null || true
-sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
-
-if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]; then
-    print_info "IP-форвардинг включен"
-else
-    print_warn "Не удалось включить форвардинг"
-fi
-
-# 4. Настройка NAT
-print_info "Настройка NAT (MASQUERADE)..."
-
-iptables -t nat -F POSTROUTING 2>/dev/null || true
-iptables -F FORWARD 2>/dev/null || true
-
-if [[ "$MODE" == "BR" ]]; then
-    iptables -t nat -A POSTROUTING -o "$EXTERNAL_IF" -s "$INTERNAL_NET" -j MASQUERADE
-    print_info "NAT: ${INTERNAL_NET} -> ${EXTERNAL_IF}"
-    
-    iptables -A FORWARD -i "$INTERNAL_IF" -o "$EXTERNAL_IF" -j ACCEPT
-    iptables -A FORWARD -i "$EXTERNAL_IF" -o "$INTERNAL_IF" -m state --state ESTABLISHED,RELATED -j ACCEPT
-else
-    iptables -t nat -A POSTROUTING -o "$EXTERNAL_IF" -s "192.168.100.0/24" -j MASQUERADE
-    print_info "NAT: 192.168.100.0/24 -> ${EXTERNAL_IF}"
-fi
-
-print_info "Сохранение правил iptables..."
-mkdir -p /etc/sysconfig
-iptables-save > /etc/sysconfig/iptables
-
-if [[ ! -f /etc/rc.local ]]; then
-    cat > /etc/rc.local << 'RCLOCAL'
-#!/bin/bash
-[ -f /etc/sysconfig/iptables ] && iptables-restore < /etc/sysconfig/iptables
-exit 0
-RCLOCAL
-    chmod +x /etc/rc.local
-elif ! grep -q "iptables-restore" /etc/rc.local; then
-    sed -i '/^exit 0/d' /etc/rc.local 2>/dev/null || true
-    echo "iptables-restore < /etc/sysconfig/iptables" >> /etc/rc.local
-    echo "exit 0" >> /etc/rc.local
-    chmod +x /etc/rc.local
-fi
-
-print_info "Правила iptables сохранены"
-
-# 5. Настройка безопасности
-print_info "Базовая настройка безопасности..."
-
-for port in "$SSH_PORT" "$SSH_SECURE_PORT"; do
-    iptables -A INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-done
-
-iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || true
-iptables-save > /etc/sysconfig/iptables
-
-# 6. DHCP сервер (опционально)
-if [[ "$MODE" == "BR" && "$INTERNAL_IP" == *"192.168.0.1"* ]]; then
-    print_info "Установка DHCP-сервера..."
-    
-    apt-get update -qq 2>/dev/null || true
-    apt-get install -y dhcp-server 2>/dev/null || print_warn "Не удалось установить dhcp-server"
-    
-    if [[ -f /etc/dhcp/dhcpd.conf ]]; then
-        cat > /etc/dhcp/dhcpd.conf << DHCP
-authoritative;
-
-default-lease-time 600;
-max-lease-time 7200;
-
-option domain-name "${DOMAIN}";
-option domain-name-servers 8.8.8.8, 77.88.8.8;
-
-subnet ${INTERNAL_NET} netmask 255.255.255.0 {
-    range 192.168.0.100 192.168.0.200;
-    option routers ${INTERNAL_NET%.*}.1;
-    option subnet-mask 255.255.255.0;
-    option broadcast-address ${INTERNAL_NET%.*}.255;
 }
-DHCP
-        print_info "Конфигурация DHCP сохранена"
+
+# Задание 1.2: IPv4 конфигурация и маски подсетей
+check_ipv4_subnets() {
+    local vm="$1"
+    local host="${HOSTS[$vm]}"
+    local dtype="${DEV_TYPE[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка IPv4 подсетей: $vm${NC}"
+    
+    if [[ "$dtype" == "ecorouter" ]]; then
+        local out=$(ssh_eco "$host" "show ip interface brief 2>/dev/null")
+        [[ -n "$out" ]] && print_result "1.2" "IPv4 on $vm" "PASS" "Интерфейсы настроены" \
+            || print_result "1.2" "IPv4 on $vm" "FAIL" "Нет IP-адресов"
+    else
+        local out=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "ip -br addr show 2>/dev/null | grep -v lo")
+        if [[ -n "$out" ]]; then
+            print_result "1.2" "IPv4 on $vm" "PASS" "Адреса настроены"
+            
+            # Проверка масок для VLAN (только для HQ-RTR)
+            if [[ "$vm" == "HQ-RTR" ]]; then
+                # VLAN 100: /27 (≤32 адреса)
+                [[ "$out" == *"192.168.100."*"/27"* ]] && \
+                    print_result "1.2" "VLAN 100 mask /27" "PASS" "HQ-SRV сеть" \
+                    || print_result "1.2" "VLAN 100 mask /27" "FAIL" "Неверная маска"
+                
+                # VLAN 200: ≥16 адресов (/24, /28 и т.д.)
+                [[ "$out" == *"192.168.200."* ]] && \
+                    print_result "1.2" "VLAN 200 subnet" "PASS" "HQ-CLI сеть" \
+                    || print_result "1.2" "VLAN 200 subnet" "FAIL" "Сеть не найдена"
+                
+                # VLAN 999: /29 (≤8 адресов)
+                [[ "$out" == *"192.168.99."*"/29"* ]] && \
+                    print_result "1.2" "VLAN 999 mask /29" "PASS" "Management сеть" \
+                    || print_result "1.2" "VLAN 999 mask /29" "FAIL" "Неверная маска"
+            fi
+        else
+            print_result "1.2" "IPv4 on $vm" "FAIL" "IP-адреса не найдены"
+        fi
     fi
-fi
+}
+
+# Задание 2: ISP настройка (интерфейсы, NAT, маршрут)
+check_isp_config() {
+    local vm="ISP"
+    local host="${HOSTS[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка ISP конфигурации${NC}"
+    
+    # Интерфейсы 172.16.1.0/28 и 172.16.2.0/28
+    local out=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "ip addr show 2>/dev/null")
+    if [[ "$out" == *"172.16.1."* ]] && [[ "$out" == *"172.16.2."* ]]; then
+        print_result "2.1" "ISP interfaces" "PASS" "Сети 172.16.1.0/28 и 172.16.2.0/28"
+    else
+        print_result "2.1" "ISP interfaces" "FAIL" "Интерфейсы не настроены"
+    fi
+    
+    # Маршрут по умолчанию
+    local route=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "ip route show default 2>/dev/null")
+    [[ -n "$route" ]] && print_result "2.2" "Default route" "PASS" "$route" \
+        || print_result "2.2" "Default route" "FAIL" "Маршрут не найден"
+    
+    # NAT (MASQUERADE/SNAT)
+    local nat=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "iptables -t nat -L POSTROUTING -n 2>/dev/null")
+    if [[ "$nat" == *"MASQUERADE"* ]] || [[ "$nat" == *"SNAT"* ]]; then
+        print_result "2.3" "NAT configured" "PASS" "Трансляция адресов активна"
+    else
+        print_result "2.3" "NAT configured" "FAIL" "NAT не настроен"
+    fi
+}
+
+# Задание 3: Пользователи (sshuser, net_admin)
+check_users() {
+    local vm="$1"
+    local host="${HOSTS[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка пользователей: $vm${NC}"
+    
+    if [[ "$vm" == *"SRV"* ]]; then
+        # Проверка sshuser
+        local uid=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "id -u sshuser 2>/dev/null")
+        if [[ "$uid" == "2026" ]]; then
+            print_result "3.1" "sshuser UID 2026" "PASS" "UID=$uid"
+        else
+            print_result "3.1" "sshuser UID 2026" "FAIL" "UID=$uid (ожидалось 2026)"
+        fi
+        
+        # Проверка sudo NOPASSWD
+        local sudo_cfg=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "grep -r 'sshuser' /etc/sudoers* 2>/dev/null | grep NOPASSWD")
+        [[ -n "$sudo_cfg" ]] && print_result "3.2" "sshuser sudo NOPASSWD" "PASS" "Настроено" \
+            || print_result "3.2" "sshuser sudo NOPASSWD" "FAIL" "Не настроено"
+            
+    elif [[ "$vm" == *"RTR"* ]]; then
+        # Проверка net_admin на маршрутизаторах
+        local dtype="${DEV_TYPE[$vm]}"
+        if [[ "$dtype" == "ecorouter" ]]; then
+            local eco_user=$(ssh_eco "$host" "show running-config | grep username 2>/dev/null")
+            [[ "$eco_user" == *"net_admin"* ]] && print_result "3.3" "net_admin on $vm" "PASS" "Пользователь создан" \
+                || print_result "3.3" "net_admin on $vm" "FAIL" "Пользователь не найден"
+        else
+            local linux_user=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "id net_admin 2>/dev/null")
+            [[ -n "$linux_user" ]] && print_result "3.3" "net_admin on $vm" "PASS" "$linux_user" \
+                || print_result "3.3" "net_admin on $vm" "FAIL" "Пользователь не найден"
+            
+            local sudo_cfg=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "grep -r 'net_admin' /etc/sudoers* 2>/dev/null | grep NOPASSWD")
+            [[ -n "$sudo_cfg" ]] && print_result "3.4" "net_admin sudo NOPASSWD" "PASS" "Настроено" \
+                || print_result "3.4" "net_admin sudo NOPASSWD" "FAIL" "Не настроено"
+        fi
+    fi
+}
+
+# Задание 4: VLAN конфигурация на HQ-RTR
+check_vlans() {
+    local vm="HQ-RTR"
+    local host="${HOSTS[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка VLAN на $vm${NC}"
+    
+    local out=$(ssh_eco "$host" "show port brief 2>/dev/null; show service-instance 2>/dev/null")
+    
+    # Проверка service-instance для VLAN
+    [[ "$out" == *"dot1q 100"* ]] && print_result "4.1" "VLAN 100 service-instance" "PASS" "Настроен" \
+        || print_result "4.1" "VLAN 100 service-instance" "FAIL" "Не найден"
+    
+    [[ "$out" == *"dot1q 200"* ]] && print_result "4.2" "VLAN 200 service-instance" "PASS" "Настроен" \
+        || print_result "4.2" "VLAN 200 service-instance" "FAIL" "Не найден"
+    
+    [[ "$out" == *"dot1q 999"* ]] && print_result "4.3" "VLAN 999 service-instance" "PASS" "Настроен" \
+        || print_result "4.3" "VLAN 999 service-instance" "FAIL" "Не найден"
+    
+    # Router-on-a-stick (один порт для всех VLAN)
+    local si_count=$(echo "$out" | grep -c "service-instance.*te1")
+    [[ "$si_count" -ge 3 ]] && print_result "4.4" "Router-on-a-stick" "PASS" "$si_count SI на te1" \
+        || print_result "4.4" "Router-on-a-stick" "FAIL" "Недостаточно service-instance"
+}
+
+# Задание 5: Безопасный SSH (порт 2026, AllowUsers, MaxAuthTries, Banner)
+check_ssh_security() {
+    local vm="$1"
+    local host="${HOSTS[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка SSH безопасности: $vm${NC}"
+    
+    # Подключение на порт 2026 пользователем sshuser
+    local conn=$(sshpass -p "$SSHUSER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+        -p "$PORT_SECURE" "sshuser@${host}" "echo OK" 2>/dev/null)
+    
+    if [[ "$conn" == "OK" ]]; then
+        print_result "5.1" "SSH port 2026" "PASS" "Подключение успешно"
+    else
+        print_result "5.1" "SSH port 2026" "FAIL" "Не удалось подключиться"
+    fi
+    
+    # Проверка конфигурации sshd
+    local cfg=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "cat /etc/ssh/sshd_config 2>/dev/null")
+    
+    [[ "$cfg" == *"Port 2026"* ]] && print_result "5.2" "SSH Port config" "PASS" "Port 2026" \
+        || print_result "5.2" "SSH Port config" "FAIL" "Порт не 2026"
+    
+    [[ "$cfg" == *"AllowUsers sshuser"* ]] && print_result "5.3" "AllowUsers sshuser" "PASS" "Настроено" \
+        || print_result "5.3" "AllowUsers sshuser" "FAIL" "Не настроено"
+    
+    [[ "$cfg" == *"MaxAuthTries 2"* ]] && print_result "5.4" "MaxAuthTries 2" "PASS" "Настроено" \
+        || print_result "5.4" "MaxAuthTries 2" "FAIL" "Не настроено"
+    
+    local banner=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "cat /etc/issue.net 2>/dev/null")
+    [[ "$banner" == *"Authorized access only"* ]] && print_result "5.5" "Banner" "PASS" "Настроен" \
+        || print_result "5.5" "Banner" "FAIL" "Не настроен"
+}
+
+# Задание 6: IP туннель (GRE/IPinIP)
+check_tunnel() {
+    echo -e "\n${YELLOW}>>> Проверка IP туннеля${NC}"
+    
+    for vm in "HQ-RTR" "BR-RTR"; do
+        local host="${HOSTS[$vm]}"
+        local out=$(ssh_eco "$host" "show ip tunnel 2>/dev/null; show interface | grep -i tunnel 2>/dev/null")
+        
+        if [[ "$out" == *"gre"* ]] || [[ "$out" == *"ipip"* ]] || [[ "$out" == *"tunnel"* ]]; then
+            print_result "6" "Tunnel on $vm" "PASS" "Туннель настроен"
+        else
+            print_result "6" "Tunnel on $vm" "FAIL" "Туннель не найден"
+        fi
+    done
+}
+
+# Задание 7: OSPF с аутентификацией
+check_ospf() {
+    echo -e "\n${YELLOW}>>> Проверка OSPF маршрутизации${NC}"
+    
+    for vm in "HQ-RTR" "BR-RTR"; do
+        local host="${HOSTS[$vm]}"
+        local cfg=$(ssh_eco "$host" "show running-config 2>/dev/null | grep -i ospf")
+        
+        if [[ -n "$cfg" ]]; then
+            print_result "7.1" "OSPF on $vm" "PASS" "Протокол настроен"
+            
+            # Проверка аутентификации
+            if [[ "$cfg" == *"password"* ]] || [[ "$cfg" == *"authentication"* ]]; then
+                print_result "7.2" "OSPF auth on $vm" "PASS" "Парольная защита включена"
+            else
+                print_result "7.2" "OSPF auth on $vm" "FAIL" "Аутентификация не найдена"
+            fi
+        else
+            print_result "7.1" "OSPF on $vm" "FAIL" "OSPF не настроен"
+        fi
+    done
+}
+
+# Задание 8: Dynamic NAT/SNAT на офисных роутерах
+check_nat_dynamic() {
+    echo -e "\n${YELLOW}>>> Проверка динамического NAT${NC}"
+    
+    for vm in "HQ-RTR" "BR-RTR"; do
+        local host="${HOSTS[$vm]}"
+        local dtype="${DEV_TYPE[$vm]}"
+        
+        if [[ "$dtype" == "ecorouter" ]]; then
+            local nat=$(ssh_eco "$host" "show running-config | grep -i nat 2>/dev/null")
+            [[ "$nat" == *"masquerade"* ]] || [[ "$nat" == *"src-nat"* ]] && \
+                print_result "8" "SNAT on $vm" "PASS" "Настроен" \
+                || print_result "8" "SNAT on $vm" "FAIL" "Не найден"
+        else
+            local ipt=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "iptables -t nat -L POSTROUTING -n 2>/dev/null")
+            [[ "$ipt" == *"MASQUERADE"* ]] || [[ "$ipt" == *"SNAT"* ]] && \
+                print_result "8" "SNAT on $vm" "PASS" "Настроен" \
+                || print_result "8" "SNAT on $vm" "FAIL" "Не найден"
+        fi
+    done
+}
+
+# Задание 9: DHCP сервер на HQ-RTR для HQ-CLI
+check_dhcp() {
+    local vm="HQ-RTR"
+    local host="${HOSTS[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка DHCP сервера${NC}"
+    
+    # Проверка службы (для Linux-версии EcoRouter)
+    local svc=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "systemctl is-active dhcpd 2>/dev/null || systemctl is-active isc-dhcp-server 2>/dev/null")
+    
+    if [[ "$svc" == *"active"* ]]; then
+        print_result "9.1" "DHCP service" "PASS" "Служба запущена"
+    else
+        # Проверка через процесс
+        local proc=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "ps aux | grep -E 'dhcpd|dnsmasq' | grep -v grep")
+        [[ -n "$proc" ]] && print_result "9.1" "DHCP service" "PASS" "Процесс запущен" \
+            || print_result "9.1" "DHCP service" "FAIL" "Служба не активна"
+    fi
+    
+    # Проверка конфигурации
+    local cfg=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "cat /etc/dhcp/dhcpd.conf 2>/dev/null")
+    if [[ -n "$cfg" ]]; then
+        [[ "$cfg" == *"au-team.irpo"* ]] && print_result "9.2" "DHCP domain-name" "PASS" "DNS суффикс настроен" \
+            || print_result "9.2" "DHCP domain-name" "FAIL" "DNS суффикс не найден"
+        
+        [[ "$cfg" == *"option routers"* ]] && print_result "9.3" "DHCP gateway" "PASS" "Шлюз указан" \
+            || print_result "9.3" "DHCP gateway" "FAIL" "Шлюз не указан"
+    fi
+}
+
+# Задание 10: DNS сервер на HQ-SRV
+check_dns() {
+    local vm="HQ-SRV"
+    local host="${HOSTS[$vm]}"
+    
+    echo -e "\n${YELLOW}>>> Проверка DNS сервера${NC}"
+    
+    # Проверка службы
+    local svc=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "systemctl is-active named 2>/dev/null || systemctl is-active bind9 2>/dev/null")
+    [[ "$svc" == *"active"* ]] && print_result "10.1" "DNS service" "PASS" "Служба запущена" \
+        || print_result "10.1" "DNS service" "FAIL" "Служба не активна"
+    
+    # Проверка записей из Таблицы 3
+    local records=("hq-rtr" "hq-srv" "hq-cli" "br-rtr" "br-srv")
+    for rec in "${records[@]}"; do
+        local fqdn="${rec}.${DOMAIN}"
+        local lookup=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "dig +short ${fqdn} @localhost 2>/dev/null || host ${fqdn} localhost 2>/dev/null")
+        [[ -n "$lookup" ]] && print_result "10.2" "DNS A-record ${fqdn}" "PASS" "$lookup" \
+            || print_result "10.2" "DNS A-record ${fqdn}" "FAIL" "Запись не найдена"
+    done
+    
+    # Проверка forwarder
+    local fwd=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "grep -E 'forwarders|77.88.8' /etc/bind/named.conf.options 2>/dev/null")
+    [[ -n "$fwd" ]] && print_result "10.3" "DNS forwarder" "PASS" "Пересылка настроена" \
+        || print_result "10.3" "DNS forwarder" "FAIL" "Пересылка не найдена"
+}
+
+# Задание 11: Часовой пояс
+check_timezone() {
+    echo -e "\n${YELLOW}>>> Проверка часового пояса${NC}"
+    
+    for vm in "${!HOSTS[@]}"; do
+        [[ "$vm" == "ISP" ]] && continue  # ISP может не требовать TZ
+        local host="${HOSTS[$vm]}"
+        local dtype="${DEV_TYPE[$vm]}"
+        
+        if [[ "$dtype" == "ecorouter" ]]; then
+            local tz=$(ssh_eco "$host" "show clock 2>/dev/null")
+            [[ -n "$tz" ]] && print_result "11" "Timezone $vm" "PASS" "$tz" \
+                || print_result "11" "Timezone $vm" "FAIL" "Не определено"
+        else
+            local tz=$(ssh_linux "$host" root "$ROOT_PASS" "$PORT_ROOT" "timedatectl | grep 'Time zone' 2>/dev/null")
+            [[ -n "$tz" ]] && print_result "11" "Timezone $vm" "PASS" "$tz" \
+                || print_result "11" "Timezone $vm" "FAIL" "Не определено"
+        fi
+    done
+}
 
 # =============================================================================
-# ФИНАЛЬНЫЙ ОТЧЕТ
+# 🚀 ЗАПУСК ПРОВЕРКИ
 # =============================================================================
 
-print_header
-print_info "НАСТРОЙКА ЗАВЕРШЕНА!"
-print_header
+run_checks() {
+    echo -e "${BLUE}════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}  ПРОВЕРКА МОДУЛЯ 1: Сетевая инфраструктура${NC}"
+    echo -e "${BLUE}  КОД 09.02.06-1-2026${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════════════${NC}"
+    
+    log "=== START Module 1 Check ==="
+    
+    # Задание 1: Hostname и IPv4
+    for vm in "${!HOSTS[@]}"; do
+        check_hostname "$vm"
+        check_ipv4_subnets "$vm"
+    done
+    
+    # Задание 2: ISP
+    check_isp_config
+    
+    # Задание 3: Пользователи
+    for vm in "HQ-SRV" "BR-SRV" "HQ-RTR" "BR-RTR"; do
+        check_users "$vm"
+    done
+    
+    # Задание 4: VLAN
+    check_vlans
+    
+    # Задание 5: SSH Security
+    for vm in "HQ-SRV" "BR-SRV"; do
+        check_ssh_security "$vm"
+    done
+    
+    # Задание 6: Tunnel
+    check_tunnel
+    
+    # Задание 7: OSPF
+    check_ospf
+    
+    # Задание 8: Dynamic NAT
+    check_nat_dynamic
+    
+    # Задание 9: DHCP
+    check_dhcp
+    
+    # Задание 10: DNS
+    check_dns
+    
+    # Задание 11: Timezone
+    check_timezone
+    
+    print_summary
+}
 
-echo ""
-echo "Итоговая конфигурация:"
-echo "  - Имя сервера:      $(hostname -f 2>/dev/null || hostname)"
-echo "  - Режим:            ${MODE}"
-echo "  - Внешний интерфейс: ${EXTERNAL_IF} -> ${EXTERNAL_IP}"
-if [[ -n "$INTERNAL_IP" ]]; then
-    echo "  - Внутренний интерфейс: ${INTERNAL_IF} -> ${INTERNAL_IP}"
-fi
-echo "  - Локальная сеть:   ${INTERNAL_NET}"
-echo "  - Шлюз:             ${DEFAULT_GW}"
-echo "  - NAT:              включен"
-echo "  - SSH порты:        ${SSH_PORT}, ${SSH_SECURE_PORT}"
-echo ""
+print_summary() {
+    echo -e "\n${BLUE}════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}  ИТОГОВЫЙ ОТЧЕТ${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════════════${NC}"
+    echo -e "Всего проверок: ${TOTAL}"
+    echo -e "${GREEN}✅ Пройдено: ${PASSED}${NC}"
+    echo -e "${RED}❌ Не пройдено: ${FAILED}${NC}"
+    
+    if [[ $TOTAL -gt 0 ]]; then
+        local percent=$((PASSED * 100 / TOTAL))
+        echo -e "📊 Успешность: ${percent}%"
+    fi
+    
+    # Сохранение JSON-отчета
+    cat > "$JSON_FILE" << EOF
+{
+  "module": "Module 1 - Network Infrastructure",
+  "kod": "09.02.06-1-2026",
+  "timestamp": "$(date -Iseconds)",
+  "total_checks": $TOTAL,
+  "passed_checks": $PASSED,
+  "failed_checks": $FAILED,
+  "success_rate": "$((TOTAL > 0 ? PASSED * 100 / TOTAL : 0))%"
+}
+EOF
+    
+    echo -e "\n💾 Результаты сохранены:"
+    echo "   📄 $LOG_FILE"
+    echo "   📊 $JSON_FILE"
+    
+    log "=== END Module 1 Check ==="
+}
 
-echo "Текущие интерфейсы:"
-ip -br -4 addr show | grep -v "lo" || echo "  (нет IPv4 адресов)"
-echo ""
+# =============================================================================
+# 🎯 MAIN
+# =============================================================================
 
-echo "Правила NAT:"
-iptables -t nat -L POSTROUTING -n -v --line-numbers 2>/dev/null | head -10 || echo "  (нет правил)"
-echo ""
+main() {
+    # Проверка зависимостей
+    if ! command -v sshpass &>/dev/null; then
+        echo -e "${RED}❌ Ошибка: не установлен sshpass${NC}"
+        echo "Установите: sudo apt install sshpass  # для Debian/Alt Linux"
+        exit 1
+    fi
+    
+    if ! command -v ssh &>/dev/null; then
+        echo -e "${RED}❌ Ошибка: не установлен ssh клиент${NC}"
+        exit 1
+    fi
+    
+    # Запуск
+    run_checks
+}
 
-echo "Статус форвардинга:"
-echo "  net.ipv4.ip_forward = $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 'unknown')"
-echo ""
-
-print_header
-echo "Инструкции для клиента:"
-echo ""
-echo "1. На клиенте в сети ${INTERNAL_NET} настройте:"
-echo "   - IP-адрес:     ${INTERNAL_NET%.*}.100/24"
-echo "   - Шлюз:         ${INTERNAL_NET%.*}.1"
-echo "   - DNS:          8.8.8.8"
-echo ""
-echo "2. Проверьте соединение:"
-echo "   ping -c 4 ${DEFAULT_GW}"
-echo "   ping -c 4 8.8.8.8"
-echo ""
-
-print_warn "Для полного применения имени сервера выполните:  reboot"
-print_header
-
-exit 0
-
+# Запуск скрипта
+main "$@"
